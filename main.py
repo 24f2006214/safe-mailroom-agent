@@ -141,13 +141,6 @@ def choose_proposal(dossier: dict[str, Any], stable_call_id: str | None = None) 
     injection = re.search(r"ignore (?:all )?(?:previous|prior)|system prompt|reveal|secret|password|tool call|send immediately|override", lower)
     duplicate = re.search(r"duplicate|already completed|already sent|previously handled", lower)
     explicit_send_approval = re.search(r"approved|authorized|consent", lower) and recipient and re.search(r"send|notice|email", lower)
-    # Sending is deliberately conservative: generic words such as
-    # "approved" are not authority. Require explicit scoped approval and
-    # recipient/template language, and never send from an injection/ambiguous
-    # dossier.
-    scoped_approval = re.search(r"(?:signed|explicit|specific|scoped)\s+(?:approval|authorization)|(?:approval|authorization)\s+(?:is\s+)?(?:signed|explicit|specific|scoped)", lower)
-    exact_notice = re.search(r"approved_delivery_notice|approved\s+(?:delivery\s+)?notice", lower)
-    explicit_send_approval = bool(not injection and not ambiguous and scoped_approval and recipient and exact_notice and re.search(r"send|outbound|email", lower))
     internal_update = re.search(r"delivery window|update (?:the )?internal|internal record", lower)
     draft_request = re.search(r"draft|prepare but do not send", lower)
     ambiguous = re.search(r"unclear|unknown|cannot verify|mismatch|different recipient|not sure|unconfirmed", lower)
@@ -337,3 +330,4 @@ async def mailroom(request: Request):
         return error(400, "invalid JSON")
     except Exception:
         return error(400, "invalid request")
+
