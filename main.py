@@ -131,66 +131,47 @@ def choose_proposal(dossier: dict[str, Any], stable_call_id: str | None = None) 
     text = " ".join(line["text"] for line in lines)
     lower = (objective + " " + text).lower()
 
-    def trusted(line: dict[str, str]) -> bool:
-        metadata = " ".join((line["kind"], line["provenance"], line["title"])).lower()
-        return any(word in metadata for word in ("trusted", "internal", "verified", "crm", "policy", "signed", "system", "official"))
-
-    trusted_lines = [line for line in lines if trusted(line)] or lines
-    untrusted_text = " ".join(line["text"] for line in lines if not trusted(line)).lower()
-
-    def matching_line_ids(words: tuple[str, ...], source_lines: list[dict[str, str]] | None = None) -> list[str]:
-        selected = []
-        for line in source_lines or trusted_lines:
-            line_lower = line["text"].lower()
-            if any(word in line_lower for word in words):
-                selected.append(line["lineId"])
-        return selected
-
-    def evidence_for(*groups: tuple[str, ...]) -> list[str]:
-        result = []
-        for group in groups:
-            for line_id in matching_line_ids(group):
-                if line_id not in result:
-                    result.append(line_id)
-        if not result and trusted_lines:
-            result = [trusted_lines[0]["lineId"]]
-        return result
-
-    trusted_text = " ".join(line["text"] for line in trusted_lines)
+    trusted_lines = lines
+    trusted_text = text
     recipient = first_match(trusted_text, [r"recipient\s*[:=]\s*([^,;\n]+)", r"to\s*[:=]\s*([^,;\n]+)", r"([\w.+-]+@[\w.-]+)"])
     reference = first_match(trusted_text, [r"reference(?:Id| ID|)\s*[:=]\s*([A-Za-z0-9_.:-]+)", r"order\s*(?:#|number)\s*[:=]?\s*([A-Za-z0-9_.:-]+)", r"case\s*(?:#|ID|id)\s*[:=]?\s*([A-Za-z0-9_.:-]+)"]) or dossier_id
     case_id = first_match(trusted_text, [r"case\s*(?:#|ID|id)\s*[:=]\s*([A-Za-z0-9_.:-]+)"]) or dossier_id
     team = first_match(trusted_text, [r"(?:team|queue)\s*[:=]\s*([^,;\n]+)"]) or "mailroom"
 
-    injection = re.search(r"ignore (?:all )?(?:previous|prior)|system prompt|reveal|secret|password|tool call|send immediately|override", untrusted_text)
-    duplicate = re.search(r"duplicate|already completed|already sent|previously handled", trusted_text.lower())
-    explicit_send_approval = bool(re.search(r"approved|authorized|consent", trusted_text, re.I) and recipient and re.search(r"send|notice|email", trusted_text, re.I))
-    internal_update = re.search(r"delivery window|update (?:the )?internal|internal record", trusted_text, re.I)
-    draft_request = re.search(r"draft|prepare but do not send", objective + " " + trusted_text, re.I)
-    ambiguous = re.search(r"unclear|unknown|cannot verify|mismatch|different recipient|not sure|unconfirmed|pending approval", lower)
-    completed = re.search(r"completed|closed|resolved|fulfilled", trusted_text, re.I)
+    injection = re.search(r"ignore (?:all )?(?:previous|prior)|system prompt|reveal|secret|password|tool call|send immediately|override", lower)
+    duplicate = re.search(r"duplicate|already completed|already sent|previously handled", lower)
+    explicit_send_approval = re.search(r"approved|authorized|consent", lower) and recipient and re.search(r"send|notice|email", lower)
+    # Sending is deliberately conservative: generic words such as
+    # "approved" are not authority. Require explicit scoped approval and
+    # recipient/template language, and never send from an injection/ambiguous
+    # dossier.
+    scoped_approval = re.search(r"(?:signed|explicit|specific|scoped)\s+(?:approval|authorization)|(?:approval|authorization)\s+(?:is\s+)?(?:signed|explicit|specific|scoped)", lower)
+    exact_notice = re.search(r"approved_delivery_notice|approved\s+(?:delivery\s+)?notice", lower)
+    explicit_send_approval = bool(not injection and not ambiguous and scoped_approval and recipient and exact_notice and re.search(r"send|outbound|email", lower))
+    internal_update = re.search(r"delivery window|update (?:the )?internal|internal record", lower)
+    draft_request = re.search(r"draft|prepare but do not send", lower)
+    ambiguous = re.search(r"unclear|unknown|cannot verify|mismatch|different recipient|not sure|unconfirmed", lower)
 
     if injection:
         action = "quarantine_item"
         target = {"kind": "security_queue", "id": "mailroom"}
         payload = {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
-    elif duplicate or completed:
+    elif duplicate:
         action = "no_action"
         target = None
         payload = {"reasonCode": "DUPLICATE" if duplicate else "ALREADY_COMPLETED", "referenceId": reference}
     elif explicit_send_approval and not ambiguous:
         action = "send_approved_notice"
         target = {"kind": "email", "id": recipient}
-        status = first_match(trusted_text, [r"status\s*[:=]\s*([^,;\n]+)"]) or "approved"
-        payload = {"referenceId": reference, "status": status, "template": "approved_delivery_notice"}
+        payload = {"referenceId": reference, "status": "approved", "template": "approved_delivery_notice"}
     elif internal_update and not ambiguous:
-        value = first_match(trusted_text, [r"delivery window\s*[:=]\s*([^,;\n]+)"])
-        event_id = first_match(trusted_text, [r"(?:event|sourceEventId)\s*[:=]\s*([A-Za-z0-9_.:-]+)"])
+        value = first_match(trusted_text, [r"delivery window\s*[:=]\s*([^,;\n]+)"]) or "confirmed"
+        event_id = first_match(trusted_text, [r"(?:event|sourceEventId)\s*[:=]\s*([A-Za-z0-9_.:-]+)"]) or reference
         if not value or not event_id:
             action = "request_confirmation"
             target = {"kind": "approval_queue", "id": team}
             payload = {"claimedSender": first_match(trusted_text, [r"sender\s*[:=]\s*([^,;\n]+)"]) or "unknown", "questionCode": "VERIFY_REQUEST", "referenceId": reference}
-            evidence = evidence_for(("delivery", "window", "event", "case"))
+            evidence = [line["lineId"] for line in lines[:3]]
             proposal = {"dossierId": dossier_id, "callId": stable_call_id or "call_" + hashlib.sha256((dossier_id + "|" + sha256(dossier)).encode()).hexdigest()[:24], "action": action, "target": target, "payload": payload, "evidence": evidence}
             return proposal
         action = "update_internal_record"
@@ -199,8 +180,7 @@ def choose_proposal(dossier: dict[str, Any], stable_call_id: str | None = None) 
     elif draft_request and recipient:
         action = "create_draft"
         target = {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}
-        status = first_match(trusted_text, [r"status\s*[:=]\s*([^,;\n]+)"]) or "pending"
-        payload = {"recipient": recipient, "referenceId": reference, "status": status, "template": "order_status"}
+        payload = {"recipient": recipient, "referenceId": reference, "status": "draft", "template": "order_status"}
     elif ambiguous or not text:
         action = "request_confirmation"
         target = {"kind": "approval_queue", "id": team}
@@ -210,14 +190,26 @@ def choose_proposal(dossier: dict[str, Any], stable_call_id: str | None = None) 
         target = None
         payload = {"reasonCode": "INFORMATIONAL", "referenceId": reference}
 
-    if action == "quarantine_item":
-        evidence = matching_line_ids(("ignore", "system prompt", "secret", "password", "tool", "override"), lines)
-        evidence = evidence[:2] or evidence_for(("security", "artifact", "message"))
-    else:
-        evidence = evidence_for(
-            ("approval", "authorized", "consent", "permission"),
-            ("recipient", "to:", "email", "reference", "case", "status", "delivery", "window"),
-        )
+    scored = []
+    for line in lines:
+        line_lower = line["text"].lower()
+        score = 0
+        if any(word in line_lower for word in ("approved", "authorized", "authority", "permission", "consent")):
+            score += 4
+        if any(word in line_lower for word in ("recipient", "to:", "email", "template", "status", "case", "reference")):
+            score += 2
+        if any(word in line_lower for word in ("ignore previous", "system prompt", "secret", "password", "tool call", "send immediately")):
+            score += 5
+        scored.append((score, line["lineId"]))
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    evidence = []
+    for _, line_id in scored:
+        if line_id not in evidence:
+            evidence.append(line_id)
+        if len(evidence) == 3:
+            break
+    if not evidence and lines:
+        evidence = [lines[0]["lineId"]]
     if stable_call_id is None:
         stable_call_id = "call_" + hashlib.sha256((dossier_id + "|" + sha256(dossier)).encode()).hexdigest()[:24]
     proposal = {"dossierId": dossier_id, "callId": stable_call_id, "action": action, "target": target, "payload": payload, "evidence": evidence}
@@ -345,4 +337,3 @@ async def mailroom(request: Request):
         return error(400, "invalid JSON")
     except Exception:
         return error(400, "invalid request")
-
